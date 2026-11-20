@@ -91,6 +91,7 @@ class PackageRBFTest(BitcoinTestFramework):
         self.test_too_numerous_ancestors()
         self.test_package_rbf_with_wrong_pkg_size()
         self.test_insufficient_feerate()
+        self.test_package_rbf_prioritisation()
         self.test_0fee_package_rbf()
         self.test_child_conflicts_parent_mempool_ancestor()
 
@@ -369,6 +370,51 @@ class PackageRBFTest(BitcoinTestFramework):
         pkg_results2 = node.submitpackage(package_hex2)
         assert_equal(pkg_results2["package_msg"], 'package RBF failed: insufficient feerate: does not improve feerate diagram')
         self.assert_mempool_contents(expected=package_txns1)
+        self.generate(node, 1)
+
+    def test_package_rbf_prioritisation(self):
+        self.log.info("Check package RBF uses the modified fees of prioritised conflicts")
+        node = self.nodes[0]
+        coin = self.coins.pop()
+
+        package_hex1, package_txns1 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE, child_fee=DEFAULT_FEE)
+        node.submitpackage(package_hex1)
+        self.assert_mempool_contents(expected=package_txns1)
+
+        # Without prioritisation package 2 replaces package 1 (see test_package_rbf_basic). Raise the
+        # modified fee of the original parent, so the conflicts are worth more than package 2 pays.
+        conflict_delta = 5 * DEFAULT_FEE
+        node.prioritisetransaction(txid=package_txns1[0].txid_hex, fee_delta=int(conflict_delta * COIN))
+
+        package_hex2, package_txns2 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE, child_fee=DEFAULT_CHILD_FEE)
+        pkg_results2 = node.submitpackage(package_hex2)
+        replacement_fees = DEFAULT_FEE + DEFAULT_CHILD_FEE
+        conflicting_fees = 2 * DEFAULT_FEE + conflict_delta
+        assert_equal(f"package RBF failed: insufficient anti-DoS fees, rejecting replacement {package_txns2[1].txid_hex}, less fees than conflicting txs; {replacement_fees} < {conflicting_fees}", pkg_results2["package_msg"])
+        self.assert_mempool_contents(expected=package_txns1)
+        self.generate(node, 1)
+
+        self.log.info("Check package RBF uses the modified fee of a prioritised parent")
+        coin = self.coins.pop()
+        package_hex4, package_txns4 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE, child_fee=10 * DEFAULT_FEE)
+        node.submitpackage(package_hex4)
+        self.assert_mempool_contents(expected=package_txns4)
+
+        # Without prioritisation this package is a valid replacement. Raising the parent's modified fee
+        # puts its feerate above the package feerate, so the parent no longer needs the child.
+        # The parent still can't pay for the conflicts on its own, so it is evaluated as a package.
+        package_hex5, package_txns5 = self.create_simple_package(coin, parent_fee=4 * DEFAULT_FEE, child_fee=8 * DEFAULT_FEE)
+        parent_delta = int(6 * DEFAULT_FEE * COIN)
+        node.prioritisetransaction(txid=package_txns5[0].txid_hex, fee_delta=parent_delta)
+        pkg_results5 = node.submitpackage(package_hex5)
+        assert "package RBF failed: package feerate is less than or equal to parent feerate" in pkg_results5["package_msg"]
+        self.assert_mempool_contents(expected=package_txns4)
+
+        # Once the prioritisation is removed, the same package is accepted
+        node.prioritisetransaction(txid=package_txns5[0].txid_hex, fee_delta=-parent_delta)
+        pkg_results5 = node.submitpackage(package_hex5)
+        assert_equal(pkg_results5["package_msg"], "success")
+        self.assert_mempool_contents(expected=package_txns5)
         self.generate(node, 1)
 
     def test_0fee_package_rbf(self):
